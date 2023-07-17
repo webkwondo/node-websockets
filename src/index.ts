@@ -12,7 +12,13 @@ import {
   getRoomIdsByPlayerId,
   getSingleRooms,
   getWinners,
-  loadDB
+  loadDB,
+  calculateAttackResult,
+  Coords,
+  AttackResultStatus,
+  getOtherPlayerIdInRoom,
+  getRandomHit,
+  addWinner
 } from './db/db.js';
 
 const HOST = '127.0.0.1';
@@ -48,6 +54,7 @@ interface Sent {
   | 'update_room'
   | 'create_game'
   | 'start_game'
+  | 'attack'
   | 'turn'
   | 'finish',
   data: string,
@@ -63,7 +70,7 @@ interface PlayerGameData {
   idPlayer: number,
 }
 
-interface SentPlayerBoardData extends Omit<PlayerGameBoard, 'gameId' | 'indexPlayer'> {
+interface SentPlayerBoardData extends Omit<PlayerGameBoard, 'gameId' | 'indexPlayer' | 'hits'> {
   currentPlayerIndex: number,
 }
 
@@ -75,7 +82,22 @@ interface AttackData {
   gameId: number,
   x: number,
   y: number,
-  indexPlayer: number, // id of the player in the current game
+  indexPlayer: number,
+}
+
+interface RandomAttackData {
+  gameId: number,
+  indexPlayer: number,
+}
+
+interface AttackFeedbackData {
+  position: Coords,
+  currentPlayer: number,
+  status: AttackResultStatus,
+}
+
+interface FinishData {
+  winPlayer: number,
 }
 
 const sendRooms = async (clients: Set<WebSocket> | WebSocket) => {
@@ -176,6 +198,38 @@ const sendTurn = async (currentPlayer: number, clients: Set<WebSocket>) => {
   clients.forEach((client) => {
     if (client.readyState === WebSocket.OPEN) {
       client.send(JSON.stringify(resTurn));
+    }
+  });
+};
+
+const sendAttackFeedback = async (data: AttackFeedbackData, clients: Set<WebSocket>) => {
+  const resAttackFeedback: Sent = {
+    type: 'attack',
+    data: JSON.stringify(data),
+    id: 0,
+  };
+
+  clients.forEach((client) => {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(JSON.stringify(resAttackFeedback));
+    }
+  });
+};
+
+const sendFinish = async (winPlayer: number, clients: Set<WebSocket>) => {
+  const data: FinishData = {
+    winPlayer
+  };
+
+  const resFinish: Sent = {
+    type: 'finish',
+    data: JSON.stringify(data),
+    id: 0,
+  };
+
+  clients.forEach((client) => {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(JSON.stringify(resFinish));
     }
   });
 };
@@ -354,26 +408,94 @@ wss.on('connection', async (ws) => {
         }
 
         break;
+      case 'randomAttack':
       case 'attack':
         // Attack feedback (should be sent after every shot, miss and after kill sent miss for all cells around ship too)
 
-        // {
-        //   type: 'attack';,
-        //   data: {
-        //     position: {
-        //       x: <number>,
-        //       y: <number>,
-        //     },
-        //     currentPlayer: <number>, // id of the player in the current game
-        //     status: 'miss' | 'killed' | 'shot',
-        //   },
-        //   id: 0,
-        // }
+        let attackData: AttackData | null = null;
 
-        // console.info(`Player: ${player.name}, index: ${player.index}`);
-        break;
-      case 'randomAttack':
-        // console.info(`Player: ${player.name}, index: ${player.index}`);
+        connectionInfo = connections.get(ws);
+
+        if (type === 'randomAttack') {
+          const randomAttackData = JSON.parse(data) as RandomAttackData;
+          const randomHit = await getRandomHit(connectionInfo?.gameId, randomAttackData.indexPlayer);
+
+          if (randomHit) {
+            attackData = {
+              gameId: randomAttackData.gameId,
+              x: randomHit?.x,
+              y: randomHit?.y,
+              indexPlayer: randomAttackData.indexPlayer
+            };
+          }
+        } else if (type === 'attack') {
+          attackData = JSON.parse(data) as AttackData;
+        }
+
+        if (attackData) {
+          const feedback = await calculateAttackResult(
+            connectionInfo?.gameId,
+            attackData.indexPlayer,
+            attackData.x,
+            attackData.y
+          );
+
+          if (feedback && connectionInfo?.gameId) {
+            const wsSet = getConnectionsByGameId(connectionInfo.gameId);
+
+            const attackFeedbackData: AttackFeedbackData = {
+              position: {
+                x: attackData.x,
+                y: attackData.y,
+              },
+              currentPlayer: attackData.indexPlayer,
+              status: feedback.result,
+            };
+
+            if (wsSet) {
+              await sendAttackFeedback(attackFeedbackData, wsSet);
+
+              if (feedback.missedCells) {
+                for await (const cell of feedback.missedCells) {
+                  const missedCellData: AttackFeedbackData = {
+                    ...attackFeedbackData,
+                    position: {
+                      x: cell.x,
+                      y: cell.y,
+                    },
+                    status: 'miss',
+                  };
+
+                  await sendAttackFeedback(missedCellData, wsSet);
+                  await sendTurn(attackData.indexPlayer, wsSet);
+                }
+              }
+
+              let playerIdTurn: number | null = attackData.indexPlayer;
+
+              if (feedback.result === 'miss') {
+                const otherPlayerId = await getOtherPlayerIdInRoom(attackData.indexPlayer, connectionInfo.gameId);
+                playerIdTurn = otherPlayerId;
+              }
+
+              if (playerIdTurn !== null) await sendTurn(playerIdTurn, wsSet);
+
+              console.info(`Attack result: ${feedback.result}`);
+              console.info(`Player ${playerIdTurn} turn`);
+
+              if (feedback.isGameOver && playerIdTurn) {
+                await sendFinish(playerIdTurn, wsSet);
+                const winner = await addWinner(playerIdTurn);
+                await sendWinners(wss.clients);
+
+                if (winner) {
+                  console.info(`Game over, winner ${winner?.name}, wins: ${winner.wins}`);
+                }
+              }
+            }
+          }
+        }
+
         break;
       default:
         break;
@@ -382,7 +504,6 @@ wss.on('connection', async (ws) => {
 
   ws.on('close', () => {
     connections.delete(ws);
-    // removePlayerFromGameRoom(ws);
     console.info(`Player ${player?.name} ${player?.index} left the room`);
   });
 });
